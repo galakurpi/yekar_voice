@@ -1,0 +1,50 @@
+[hotkey]
+modifiers = ["ctrl", "alt"]
+trigger = "q"
+paste_last = ["ctrl", "alt", "v"]
+cancel = "escape"
+
+[audio]
+target_sample_rate_hz = 24000
+channels = 1
+tail_ms = 120
+min_audio_ms = 250
+device = ""
+
+[asr]
+backend = "openai"
+streaming_enabled = true
+openai_model = "gpt-4o-mini-transcribe"
+local_model = "base.en"
+language = ""
+timeout_ms = 5000
+
+[rewrite]
+enabled = true
+model = "gpt-5.3-chat-latest"
+timeout_ms = 3000
+
+[paste]
+restore_clipboard = false
+keybinding = "ctrl+v"
+
+[metrics]
+store_transcript_text = false
+
+[developer_profile]
+glossary = [
+  "YekarOS",
+  "run-pipeline",
+  "kanban-loop",
+  "Claude Code",
+  "Codex",
+  "Pop!_OS",
+  "PipeWire",
+  "Whisper",
+  "Ctrl+Alt+Q",
+]
+replacements = [
+  ["pipe wire", "PipeWire"],
+  ["pop os", "Pop!_OS"],
+  ["x eleven", "X11"],
+]
