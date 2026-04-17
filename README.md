@@ -9,10 +9,16 @@ Current runtime:
 - Local native Rust Whisper inference through Candle remains available as an opt-in fallback
 - Captures at 24kHz for the OpenAI streaming path and resamples automatically for local Whisper
 - Always runs the developer-focused rewrite pass when enabled
-- Copies the final transcript into the clipboard on release
+- Auto-pastes into the focused field and also leaves the final transcript in the clipboard
 - Stores per-session timings in SQLite
 - `Esc` cancels the current recording
-- `Ctrl+Alt+V` pastes the last transcript again if you want an explicit paste step
+- `Ctrl+Alt+V` pastes the last transcript again
+
+Current scope:
+- Linux desktop
+- X11 only for now
+- GNOME/Pop!_OS is the main tested environment
+- Terminal paste is best-effort and currently uses `Ctrl+Shift+V`
 
 ## Quick Start
 
@@ -32,6 +38,7 @@ Useful commands:
 cargo run --release -- stats
 cargo run --release -- recent --limit 20
 cargo run --release -- benchmark
+cargo test
 ```
 
 ## Config
@@ -45,6 +52,37 @@ Metrics DB:
 Optional repo-local secrets file:
 - `.env`
 - expected key: `OPENAI_API_KEY=...`
+
+## Privacy
+
+Default behavior:
+- If `asr.backend = "openai"`, microphone audio is sent to OpenAI for transcription
+- If rewrite is enabled, transcript text is sent to OpenAI for cleanup
+- Metrics are stored locally in SQLite
+- Full transcript storage is disabled by default unless you enable `metrics.store_transcript_text`
+
+Local-first options:
+- You can switch STT to the local Whisper backend in config
+- Even with local STT, the rewrite step is still networked unless you disable rewrite
+
+Operational expectations:
+- Bring your own OpenAI API key
+- Do not commit `.env`
+- Review your config before sharing logs or metrics dumps
+
+## Open Source Notes
+
+- Public repo does not mean API usage is free; users pay their own provider costs
+- This project is still early and desktop-specific
+- Contributions that improve X11 paste reliability, terminal handling, and instrumentation are useful
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## Systemd User Service
 
