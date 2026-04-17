@@ -17,8 +17,8 @@ Current runtime:
 ## Quick Start
 
 ```bash
-git clone https://github.com/galakurpi/voice-dictation.git
-cd voice-dictation
+git clone https://github.com/galakurpi/yekar_voice.git
+cd yekar_voice
 . "$HOME/.cargo/env"
 cargo run --release -- doctor
 # optional: preload the local Whisper fallback
@@ -48,5 +48,5 @@ Optional repo-local secrets file:
 
 ## Systemd User Service
 
-The included [voice-dictation.service](voice-dictation.service) assumes the repo is cloned to `%h/src/voice-dictation`.
+The included [voice-dictation.service](voice-dictation.service) assumes the repo is cloned to `%h/src/yekar_voice`.
 If you clone somewhere else, edit `WorkingDirectory` and `ExecStart` first.

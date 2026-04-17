@@ -128,9 +128,13 @@ struct RewriteConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct PasteConfig {
     #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_true")]
     restore_clipboard: bool,
     #[serde(default = "default_paste_binding")]
     keybinding: String,
+    #[serde(default = "default_terminal_paste_binding")]
+    terminal_keybinding: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -226,8 +230,10 @@ impl Default for RewriteConfig {
 impl Default for PasteConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             restore_clipboard: false,
             keybinding: default_paste_binding(),
+            terminal_keybinding: default_terminal_paste_binding(),
         }
     }
 }
@@ -246,6 +252,10 @@ fn default_paste_last() -> Vec<String> {
 
 fn default_cancel() -> String {
     "escape".to_string()
+}
+
+fn default_terminal_paste_binding() -> String {
+    "ctrl+shift+v".to_string()
 }
 
 fn default_target_sample_rate() -> u32 {
@@ -884,9 +894,13 @@ impl Rewriter {
         };
         let system_prompt = r#"You rewrite speech-to-text into clean written text for software development work.
 
-Preserve meaning exactly. Fix punctuation, capitalization, spacing, and obvious grammar. Keep code identifiers, filenames, library names, commands, acronyms, and technical words intact. Do not invent code, filenames, or facts. If the text is already clean, make minimal edits.
+Preserve meaning exactly. Be literal. Do not paraphrase. Do not swap words for nicer words. Do not rewrite wording unless it is required to fix punctuation, capitalization, spacing, obvious grammar, or a clear speech-to-text mistake.
 
-When the speaker uses spoken software-style markers, convert them into the written form that a developer would expect. This includes things like slash commands, underscores, and explicit spoken list delimiters when the intent is clear.
+Keep code identifiers, filenames, library names, commands, acronyms, and technical words intact. Do not invent code, filenames, commands, or facts. If the text is already clean, make minimal edits.
+
+When the speaker uses spoken software-style markers, convert them into the written form that a developer would expect. This includes things like slash commands, underscores, spoken formatting delimiters, and special markers like <list_open> and <list_close>.
+
+Treat phrases like "open list", "open the list", "close list", and "close the list" as formatting delimiters, not as literal list items, when they clearly introduce or close a spoken list.
 
 Examples:
 - "Execute slash go command" -> "Execute /go command."
@@ -896,6 +910,10 @@ Examples:
 - B
 - C
 Then verify all"
+- "I want to do these three things, open the list, clear the cookies, fix the bugs, push it to production, close the list" -> "I want to do these three things:
+- Clear the cookies
+- Fix the bugs
+- Push it to production"
 
 Output only the final rewritten text."#;
         let payload = json!({
@@ -983,6 +1001,7 @@ fn normalize_text(text: &str, profile: &DeveloperProfile) -> String {
     out = out.replace(" Slash ", " /");
     out = out.replace(" underscore ", "_");
     out = out.replace(" Underscore ", "_");
+    out = replace_spoken_list_delimiters(&out);
     out = apply_replacements(&out, profile);
     out.lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -990,6 +1009,42 @@ fn normalize_text(text: &str, profile: &DeveloperProfile) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn replace_spoken_list_delimiters(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fragment = String::new();
+    for ch in text.chars() {
+        if matches!(ch, ',' | ';' | ':' | '\n') {
+            push_list_fragment(&mut out, &fragment);
+            fragment.clear();
+            out.push(ch);
+        } else {
+            fragment.push(ch);
+        }
+    }
+    push_list_fragment(&mut out, &fragment);
+    out
+}
+
+fn push_list_fragment(out: &mut String, fragment: &str) {
+    let trimmed = fragment.trim();
+    if let Some(marker) = list_delimiter_marker(trimmed) {
+        if fragment.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+            out.push(' ');
+        }
+        out.push_str(marker);
+        return;
+    }
+    out.push_str(fragment);
+}
+
+fn list_delimiter_marker(fragment: &str) -> Option<&'static str> {
+    match fragment.to_ascii_lowercase().as_str() {
+        "open list" | "open the list" => Some("<list_open>"),
+        "close list" | "close the list" => Some("<list_close>"),
+        _ => None,
+    }
 }
 
 fn apply_replacements(text: &str, profile: &DeveloperProfile) -> String {
@@ -2199,13 +2254,30 @@ fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
-fn active_app() -> String {
-    command_output(&["xdotool", "getwindowfocus", "getwindowclassname"])
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
 fn active_window_id() -> Option<String> {
     command_output(&["xdotool", "getwindowfocus"]).ok()
+}
+
+fn active_window_name() -> Option<String> {
+    command_output(&["xdotool", "getwindowfocus", "getwindowname"]).ok()
+}
+
+fn active_window_class() -> Option<String> {
+    let window_id = active_window_id()?;
+    command_output(&["xprop", "-id", &window_id, "WM_CLASS"]).ok()
+}
+
+fn active_app() -> String {
+    let class = active_window_class();
+    let title = active_window_name();
+    match (class, title) {
+        (Some(class), Some(title)) if !class.is_empty() && !title.is_empty() => {
+            format!("{class} {title}")
+        }
+        (Some(class), _) if !class.is_empty() => class,
+        (_, Some(title)) if !title.is_empty() => title,
+        _ => "unknown".to_string(),
+    }
 }
 
 fn write_clipboard(text: &str) -> Result<()> {
@@ -2223,14 +2295,70 @@ fn write_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn paste_text(text: &str, config: &PasteConfig) -> Result<()> {
+fn focus_window(window_id: Option<&str>) -> Result<()> {
+    let Some(window_id) = window_id else {
+        return Ok(());
+    };
+    run_command(&["xdotool", "windowactivate", "--sync", window_id])
+}
+
+fn is_terminal_app(app_name: &str) -> bool {
+    let app = app_name.to_ascii_lowercase();
+    [
+        "terminal",
+        "wezterm",
+        "kitty",
+        "alacritty",
+        "konsole",
+        "tilix",
+        "xterm",
+        "tmux",
+        "tabby",
+        "warp",
+    ]
+    .iter()
+    .any(|needle| app.contains(needle))
+}
+
+fn paste_keybinding<'a>(app_name: &str, config: &'a PasteConfig) -> &'a str {
+    if is_terminal_app(app_name) {
+        &config.terminal_keybinding
+    } else {
+        &config.keybinding
+    }
+}
+
+fn paste_text(
+    text: &str,
+    app_name: &str,
+    target_window: Option<&str>,
+    config: &PasteConfig,
+) -> Result<()> {
     write_clipboard(text)?;
     if config.restore_clipboard {
         return Err(anyhow!(
             "restore_clipboard is no longer supported; keep it false"
         ));
     }
-    run_command(&["xdotool", "key", "--clearmodifiers", &config.keybinding])?;
+    if !config.enabled {
+        return Ok(());
+    }
+    thread::sleep(Duration::from_millis(50));
+    focus_window(target_window)?;
+    thread::sleep(Duration::from_millis(50));
+    let keybinding = paste_keybinding(app_name, config);
+    if let Some(window_id) = target_window {
+        run_command(&[
+            "xdotool",
+            "key",
+            "--window",
+            window_id,
+            "--clearmodifiers",
+            keybinding,
+        ])?;
+    } else {
+        run_command(&["xdotool", "key", "--clearmodifiers", keybinding])?;
+    }
     Ok(())
 }
 
@@ -2421,7 +2549,12 @@ fn run_daemon(config: Config, metrics: &MetricsStore) -> Result<()> {
                         continue;
                     }
                     trace.mark("paste_started");
-                    let copy_result = write_clipboard(&rewrite.text);
+                    let paste_result = paste_text(
+                        &rewrite.text,
+                        &active_app_name,
+                        active_window.as_deref(),
+                        &config.paste,
+                    );
                     trace.mark("paste_finished");
                     trace.mark("session_done");
                     last_text = rewrite.text.clone();
@@ -2429,14 +2562,14 @@ fn run_daemon(config: Config, metrics: &MetricsStore) -> Result<()> {
                         asr.error_code.as_deref(),
                         rewrite.error_code.as_deref(),
                     );
-                    let (status, error_code) = if let Err(err) = copy_result {
-                        println!("Clipboard copy failed: {err}");
+                    let (status, error_code) = if let Err(err) = paste_result {
+                        println!("Paste failed: {err}");
                         overlay.show_notice("Failed", "", 2, active_window.as_deref());
-                        ("copy_failed", Some("copy_failed".to_string()))
+                        ("paste_failed", Some("paste_failed".to_string()))
                     } else {
-                        println!("Copied: {}", rewrite.text);
-                        overlay.show_notice("Copied", "", 2, active_window.as_deref());
-                        ("copied", combined_error)
+                        println!("Pasted: {}", rewrite.text);
+                        overlay.show_notice("Pasted", "", 2, active_window.as_deref());
+                        ("pasted", combined_error)
                     };
                     metrics.record_session(
                         &trace,
@@ -2459,7 +2592,13 @@ fn run_daemon(config: Config, metrics: &MetricsStore) -> Result<()> {
             }
         } else if event.id == paste_last_key.id() && event.state == HotKeyState::Pressed {
             if !last_text.is_empty() {
-                let _ = paste_text(&last_text, &config.paste);
+                let active_app_name = active_app();
+                let _ = paste_text(
+                    &last_text,
+                    &active_app_name,
+                    active_window_id().as_deref(),
+                    &config.paste,
+                );
                 println!("Re-pasted last transcript");
                 overlay.show_notice("Retry", "", 2, active_window_id().as_deref());
             }
@@ -2553,6 +2692,37 @@ fn run_benchmark(config: Config, metrics: &MetricsStore, manifest_path: PathBuf)
     }
     metrics.print_stats()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_text_marks_spoken_list_delimiters() {
+        let profile = DeveloperProfile::default();
+        let normalized = normalize_text(
+            "I want to do these three things: open the list, clear the cookies, fix the bugs, push it to production, close the list",
+            &profile,
+        );
+        assert!(normalized.contains("<list_open>"));
+        assert!(normalized.contains("<list_close>"));
+        assert!(!normalized.contains("open the list"));
+        assert!(!normalized.contains("close the list"));
+    }
+
+    #[test]
+    fn normalize_text_keeps_literal_instruction_when_not_a_delimiter() {
+        let profile = DeveloperProfile::default();
+        let normalized = normalize_text(
+            "Please open the list of deployments and check the last one.",
+            &profile,
+        );
+        assert_eq!(
+            normalized,
+            "Please open the list of deployments and check the last one."
+        );
+    }
 }
 
 fn command_exists(command: &str) -> bool {

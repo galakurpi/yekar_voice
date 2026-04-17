@@ -4,8 +4,8 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/src/voice-dictation
-ExecStart=%h/src/voice-dictation/run-daemon.sh
+WorkingDirectory=%h/src/yekar_voice
+ExecStart=%h/src/yekar_voice/run-daemon.sh
 Restart=on-failure
 RestartSec=2
 
