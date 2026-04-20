@@ -8,4 +8,6 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set +a
 fi
 cd "$SCRIPT_DIR"
-exec cargo run --release -- daemon "$@"
+# The CLI treats --config as a global option, so any wrapper arguments need to
+# come before the `daemon` subcommand.
+exec cargo run --release -- "$@" daemon
