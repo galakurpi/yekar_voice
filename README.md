@@ -88,3 +88,17 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
 The included [voice-dictation.service](voice-dictation.service) assumes the repo is cloned to `%h/src/yekar_voice`.
 If you clone somewhere else, edit `WorkingDirectory` and `ExecStart` first.
+
+Important behavior:
+- `Ctrl+Alt+Q` is not a GNOME custom shortcut or desktop launcher
+- the daemon itself grabs that hotkey on X11
+- if the daemon is not already running, pressing the shortcut does nothing
+
+For this checkout, install the user service with:
+
+```bash
+cd integrations/yekar_voice
+./install-user-service.sh
+```
+
+That script writes `~/.config/systemd/user/voice-dictation.service` with the correct local path, enables it for `graphical-session.target`, and restarts it immediately.
