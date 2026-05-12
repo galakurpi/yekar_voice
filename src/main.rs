@@ -2310,6 +2310,7 @@ fn is_terminal_app(app_name: &str) -> bool {
         "kitty",
         "alacritty",
         "konsole",
+        "terminator",
         "tilix",
         "xterm",
         "tmux",
@@ -2721,6 +2722,22 @@ mod tests {
         assert_eq!(
             normalized,
             "Please open the list of deployments and check the last one."
+        );
+    }
+
+    #[test]
+    fn terminal_detection_includes_terminator_wm_class() {
+        assert!(is_terminal_app(
+            r#"WM_CLASS(STRING) = "terminator", "Terminator" YekarOS"#
+        ));
+    }
+
+    #[test]
+    fn terminator_uses_terminal_paste_keybinding() {
+        let config = PasteConfig::default();
+        assert_eq!(
+            paste_keybinding(r#"WM_CLASS(STRING) = "terminator", "Terminator""#, &config),
+            "ctrl+shift+v"
         );
     }
 }
