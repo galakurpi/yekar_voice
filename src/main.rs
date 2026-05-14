@@ -1768,8 +1768,10 @@ impl OpenAiTranscriber {
             .mime_str("audio/wav")?;
         let mut form = multipart::Form::new()
             .text("model", self.file_model.clone())
-            .text("prompt", self.prompt.clone())
             .part("file", file_part);
+        if !self.prompt.trim().is_empty() {
+            form = form.text("prompt", self.prompt.clone());
+        }
         if !self.language.trim().is_empty() {
             form = form.text("language", self.language.clone());
         }
@@ -1796,8 +1798,10 @@ impl OpenAiTranscriber {
     fn create_realtime_client_secret(&self) -> Result<String> {
         let mut transcription = json!({
             "model": self.realtime_model.clone(),
-            "prompt": self.prompt.clone(),
         });
+        if !self.prompt.trim().is_empty() {
+            transcription["prompt"] = json!(self.prompt.clone());
+        }
         if !self.language.trim().is_empty() {
             transcription["language"] = json!(self.language);
         }
@@ -1952,7 +1956,7 @@ fn run_openai_realtime_stream(
                     "type": "input_audio_buffer.append",
                     "audio": BASE64_STANDARD.encode(pcm16_bytes),
                 });
-                if let Err(err) = socket.send(Message::Text(event.to_string().into())) {
+                if let Err(err) = queue_websocket_message(&mut socket, event) {
                     error_code = Some(format!("stream_append:{err}"));
                     break;
                 }
@@ -1981,7 +1985,7 @@ fn run_openai_realtime_stream(
 
         if commit_requested && audio_closed && pending_f32_bytes.is_empty() && !commit_sent {
             let event = json!({ "type": "input_audio_buffer.commit" });
-            if let Err(err) = socket.send(Message::Text(event.to_string().into())) {
+            if let Err(err) = queue_websocket_message(&mut socket, event) {
                 error_code = Some(format!("stream_commit:{err}"));
                 break;
             }
@@ -2070,6 +2074,11 @@ fn run_openai_realtime_stream(
             }
         }
 
+        if let Err(err) = flush_websocket(&mut socket) {
+            error_code = Some(format!("stream_flush:{err}"));
+            break;
+        }
+
         if error_code.is_some() {
             break;
         }
@@ -2089,6 +2098,31 @@ fn run_openai_realtime_stream(
         stream_ready_ms,
         first_partial_ms,
     }
+}
+
+fn queue_websocket_message(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    event: serde_json::Value,
+) -> std::result::Result<(), tungstenite::Error> {
+    match socket.write(Message::Text(event.to_string().into())) {
+        Ok(()) => Ok(()),
+        Err(err) if is_would_block(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn flush_websocket(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+) -> std::result::Result<(), tungstenite::Error> {
+    match socket.flush() {
+        Ok(()) => Ok(()),
+        Err(err) if is_would_block(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_would_block(err: &tungstenite::Error) -> bool {
+    matches!(err, tungstenite::Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 fn set_websocket_nonblocking(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
@@ -2413,18 +2447,8 @@ fn paste_text(
     focus_window(target_window)?;
     thread::sleep(Duration::from_millis(50));
     let keybinding = paste_keybinding(app_name, config);
-    if let Some(window_id) = target_window {
-        run_command(&[
-            "xdotool",
-            "key",
-            "--window",
-            window_id,
-            "--clearmodifiers",
-            keybinding,
-        ])?;
-    } else {
-        run_command(&["xdotool", "key", "--clearmodifiers", keybinding])?;
-    }
+    println!("Paste keybinding: {keybinding} app={app_name}");
+    run_command(&["xdotool", "key", "--clearmodifiers", keybinding])?;
     Ok(())
 }
 
@@ -2448,6 +2472,7 @@ fn key_from_name(name: &str) -> Result<Code> {
     match name.to_ascii_lowercase().as_str() {
         "q" => Ok(Code::KeyQ),
         "v" => Ok(Code::KeyV),
+        "space" => Ok(Code::Space),
         "escape" | "esc" => Ok(Code::Escape),
         other => Err(anyhow!("unsupported key: {other}")),
     }
@@ -2505,7 +2530,16 @@ fn run_daemon(config: Config, metrics: &MetricsStore) -> Result<()> {
     manager.register(dictate)?;
     manager.register(paste_last_key)?;
     manager.register(cancel_key)?;
-    println!("listening for hold-to-talk on Ctrl+Alt+Q");
+    let hold_shortcut = if config.hotkey.modifiers.is_empty() {
+        config.hotkey.trigger.clone()
+    } else {
+        format!(
+            "{}+{}",
+            config.hotkey.modifiers.join("+"),
+            config.hotkey.trigger
+        )
+    };
+    println!("listening for hold-to-talk on {hold_shortcut}");
     let mut last_text = String::new();
     let mut active_trace: Option<SessionTrace> = None;
     let mut active_stream: Option<OpenAiStreamHandle> = None;
@@ -2582,6 +2616,14 @@ fn run_daemon(config: Config, metrics: &MetricsStore) -> Result<()> {
                         trace.mark_at("first_partial_received", offset_ms);
                     }
                     trace.mark("asr_finished");
+                    println!(
+                        "ASR: mode={} fallback={} stream_ready_ms={:?} first_partial_ms={:?} error={:?}",
+                        asr.mode,
+                        asr.fallback_used,
+                        asr.stream_ready_ms,
+                        asr.first_partial_ms,
+                        asr.error_code
+                    );
                     let raw_text = asr.text;
                     trace.mark("rewrite_started");
                     let rewrite = rewriter.rewrite(&raw_text);
@@ -2830,6 +2872,11 @@ mod tests {
             paste_keybinding(r#"WM_CLASS(STRING) = "terminator", "Terminator""#, &config),
             "ctrl+shift+v"
         );
+    }
+
+    #[test]
+    fn key_parser_supports_space_for_push_to_talk() {
+        assert!(matches!(key_from_name("space").unwrap(), Code::Space));
     }
 }
 

@@ -1,6 +1,6 @@
 [hotkey]
-modifiers = ["ctrl", "alt"]
-trigger = "q"
+modifiers = ["alt"]
+trigger = "space"
 paste_last = ["ctrl", "alt", "v"]
 cancel = "escape"
 
@@ -12,9 +12,11 @@ min_audio_ms = 250
 device = ""
 
 [asr]
-backend = "local"
-streaming_enabled = false
-openai_model = "gpt-4o-mini-transcribe"
+backend = "openai"
+streaming_enabled = true
+openai_realtime_model = "gpt-realtime-whisper"
+openai_file_model = "gpt-4o-transcribe"
+openai_prompt = ""
 local_model = "base.en"
 language = ""
 timeout_ms = 5000
