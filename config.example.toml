@@ -14,7 +14,9 @@ device = ""
 [asr]
 backend = "openai"
 streaming_enabled = true
-openai_model = "gpt-4o-mini-transcribe"
+openai_realtime_model = "gpt-realtime-whisper"
+openai_file_model = "gpt-4o-transcribe"
+openai_prompt = "Software development dictation. Preserve exact technical terms, identifiers, acronyms, punctuation intent, and mixed English/German wording. Keywords: YekarOS, Yekar, Codex, Claude Code, Rust, TypeScript, JavaScript, Python, React, Django, Postgres, PostgreSQL, API, JSON, CLI, Git, GitHub, PR, PM2, nginx, systemd, Pop!_OS, PipeWire, X11, Ctrl+Alt+Q."
 local_model = "base.en"
 language = ""
 timeout_ms = 5000

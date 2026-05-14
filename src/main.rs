@@ -105,8 +105,14 @@ struct AsrConfig {
     backend: String,
     #[serde(default = "default_true")]
     streaming_enabled: bool,
-    #[serde(default = "default_openai_asr_model")]
-    openai_model: String,
+    #[serde(default)]
+    openai_model: Option<String>,
+    #[serde(default)]
+    openai_file_model: Option<String>,
+    #[serde(default)]
+    openai_realtime_model: Option<String>,
+    #[serde(default = "default_openai_asr_prompt")]
+    openai_prompt: String,
     #[serde(default = "default_local_asr_model")]
     local_model: String,
     #[serde(default)]
@@ -165,6 +171,36 @@ impl AsrConfig {
             other => Err(anyhow!("unsupported ASR backend: {other}")),
         }
     }
+
+    fn openai_file_model(&self) -> String {
+        if let Some(model) = non_empty_config_value(&self.openai_file_model) {
+            return model;
+        }
+        match non_empty_config_value(&self.openai_model) {
+            Some(model) if model != legacy_openai_asr_model() && !model.contains("realtime") => {
+                model
+            }
+            _ => default_openai_file_asr_model(),
+        }
+    }
+
+    fn openai_realtime_model(&self) -> String {
+        if let Some(model) = non_empty_config_value(&self.openai_realtime_model) {
+            return model;
+        }
+        match non_empty_config_value(&self.openai_model) {
+            Some(model) if model.contains("realtime") => model,
+            _ => default_openai_realtime_asr_model(),
+        }
+    }
+}
+
+fn non_empty_config_value(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 impl Default for Config {
@@ -209,7 +245,10 @@ impl Default for AsrConfig {
         Self {
             backend: default_asr_backend(),
             streaming_enabled: default_true(),
-            openai_model: default_openai_asr_model(),
+            openai_model: None,
+            openai_file_model: None,
+            openai_realtime_model: None,
+            openai_prompt: default_openai_asr_prompt(),
             local_model: default_local_asr_model(),
             language: String::new(),
             timeout_ms: default_asr_timeout_ms(),
@@ -278,8 +317,20 @@ fn default_asr_backend() -> String {
     "openai".to_string()
 }
 
-fn default_openai_asr_model() -> String {
-    "gpt-4o-mini-transcribe".to_string()
+fn default_openai_file_asr_model() -> String {
+    "gpt-4o-transcribe".to_string()
+}
+
+fn default_openai_realtime_asr_model() -> String {
+    "gpt-realtime-whisper".to_string()
+}
+
+fn legacy_openai_asr_model() -> &'static str {
+    "gpt-4o-mini-transcribe"
+}
+
+fn default_openai_asr_prompt() -> String {
+    "Software development dictation. Preserve exact technical terms, identifiers, acronyms, punctuation intent, and mixed English/German wording. Keywords: YekarOS, Yekar, Codex, Claude Code, Rust, TypeScript, JavaScript, Python, React, Django, Postgres, PostgreSQL, API, JSON, CLI, Git, GitHub, PR, PM2, nginx, systemd, Pop!_OS, PipeWire, X11, Ctrl+Alt+Q.".to_string()
 }
 
 fn default_local_asr_model() -> String {
@@ -1627,7 +1678,9 @@ impl OpenAiStreamHandle {
 struct OpenAiTranscriber {
     client: Client,
     api_key: String,
-    model: String,
+    file_model: String,
+    realtime_model: String,
+    prompt: String,
     language: String,
     timeout_ms: u64,
     streaming_enabled: bool,
@@ -1643,7 +1696,9 @@ impl OpenAiTranscriber {
         Ok(Self {
             client,
             api_key,
-            model: config.openai_model.clone(),
+            file_model: config.openai_file_model(),
+            realtime_model: config.openai_realtime_model(),
+            prompt: config.openai_prompt.clone(),
             language: config.language.clone(),
             timeout_ms: config.timeout_ms,
             streaming_enabled: config.streaming_enabled,
@@ -1663,13 +1718,15 @@ impl OpenAiTranscriber {
         let (result_tx, result_rx) = mpsc::channel();
         let client = self.client.clone();
         let api_key = self.api_key.clone();
-        let model = self.model.clone();
+        let realtime_model = self.realtime_model.clone();
+        let prompt = self.prompt.clone();
         let language = self.language.clone();
         let join = thread::spawn(move || {
             let result = run_openai_realtime_stream(
                 client,
                 api_key,
-                model,
+                realtime_model,
+                prompt,
                 language,
                 session_started_at,
                 chunk_rx,
@@ -1699,7 +1756,10 @@ impl OpenAiTranscriber {
     }
 
     fn model_name(&self) -> &str {
-        &self.model
+        if self.streaming_enabled {
+            return "openai_realtime+file";
+        }
+        "openai_file"
     }
 
     fn transcribe_wav_bytes(&self, wav_bytes: Vec<u8>, file_name: &str) -> Result<String> {
@@ -1707,7 +1767,8 @@ impl OpenAiTranscriber {
             .file_name(file_name.to_string())
             .mime_str("audio/wav")?;
         let mut form = multipart::Form::new()
-            .text("model", self.model.clone())
+            .text("model", self.file_model.clone())
+            .text("prompt", self.prompt.clone())
             .part("file", file_part);
         if !self.language.trim().is_empty() {
             form = form.text("language", self.language.clone());
@@ -1734,7 +1795,8 @@ impl OpenAiTranscriber {
 
     fn create_realtime_client_secret(&self) -> Result<String> {
         let mut transcription = json!({
-            "model": self.model,
+            "model": self.realtime_model.clone(),
+            "prompt": self.prompt.clone(),
         });
         if !self.language.trim().is_empty() {
             transcription["language"] = json!(self.language);
@@ -1781,7 +1843,8 @@ impl OpenAiTranscriber {
 fn run_openai_realtime_stream(
     client: Client,
     api_key: String,
-    model: String,
+    realtime_model: String,
+    prompt: String,
     language: String,
     session_started_at: Instant,
     chunk_rx: Receiver<Vec<u8>>,
@@ -1790,7 +1853,9 @@ fn run_openai_realtime_stream(
     let transcriber = OpenAiTranscriber {
         client,
         api_key,
-        model,
+        file_model: default_openai_file_asr_model(),
+        realtime_model,
+        prompt,
         language,
         timeout_ms: 5_000,
         streaming_enabled: true,
@@ -2726,6 +2791,32 @@ mod tests {
     }
 
     #[test]
+    fn openai_asr_models_default_to_realtime_and_quality_file_models() {
+        let config = AsrConfig::default();
+
+        assert_eq!(config.openai_realtime_model(), "gpt-realtime-whisper");
+        assert_eq!(config.openai_file_model(), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn legacy_openai_model_no_longer_pins_weaker_default() {
+        let mut config = AsrConfig::default();
+        config.openai_model = Some("gpt-4o-mini-transcribe".to_string());
+
+        assert_eq!(config.openai_realtime_model(), "gpt-realtime-whisper");
+        assert_eq!(config.openai_file_model(), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn custom_openai_model_remains_a_file_model_override() {
+        let mut config = AsrConfig::default();
+        config.openai_model = Some("custom-transcribe-model".to_string());
+
+        assert_eq!(config.openai_realtime_model(), "gpt-realtime-whisper");
+        assert_eq!(config.openai_file_model(), "custom-transcribe-model");
+    }
+
+    #[test]
     fn terminal_detection_includes_terminator_wm_class() {
         assert!(is_terminal_app(
             r#"WM_CLASS(STRING) = "terminator", "Terminator" YekarOS"#
@@ -2766,7 +2857,14 @@ fn run_doctor(config: &Config, config_path: &Path, metrics_path: &Path) -> Resul
             println!("Local Whisper repo: {} @ {}", spec.repo_id, spec.revision);
         }
         AsrBackend::OpenAi => {
-            println!("OpenAI transcription model: {}", config.asr.openai_model);
+            println!(
+                "OpenAI realtime transcription model: {}",
+                config.asr.openai_realtime_model()
+            );
+            println!(
+                "OpenAI file fallback transcription model: {}",
+                config.asr.openai_file_model()
+            );
             println!("OpenAI streaming enabled: {}", config.asr.streaming_enabled);
             println!("OpenAI transcription timeout ms: {}", config.asr.timeout_ms);
             println!(

@@ -6,6 +6,8 @@ Current runtime:
 - Hold `Ctrl+Alt+Q` to record
 - Shows a tiny floating status bubble while listening and finalizing
 - Release to stream/finalize OpenAI STT by default
+- Uses OpenAI realtime transcription with `gpt-realtime-whisper` by default
+- Falls back to `/audio/transcriptions` with `gpt-4o-transcribe`
 - Local native Rust Whisper inference through Candle remains available as an opt-in fallback
 - Captures at 24kHz for the OpenAI streaming path and resamples automatically for local Whisper
 - Always runs the developer-focused rewrite pass when enabled
@@ -57,6 +59,9 @@ Optional repo-local secrets file:
 
 Default behavior:
 - If `asr.backend = "openai"`, microphone audio is sent to OpenAI for transcription
+- Realtime dictation uses `asr.openai_realtime_model`
+- File fallback uses `asr.openai_file_model`
+- Legacy `asr.openai_model = "gpt-4o-mini-transcribe"` is treated as the old default and no longer pins the app to that weaker model
 - If rewrite is enabled, transcript text is sent to OpenAI for cleanup
 - Metrics are stored locally in SQLite
 - Full transcript storage is disabled by default unless you enable `metrics.store_transcript_text`
