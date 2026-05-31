@@ -1108,6 +1108,7 @@ fn apply_replacements(text: &str, profile: &DeveloperProfile) -> String {
 }
 
 enum OverlayBackend {
+    Bubble(PathBuf),
     Zenity,
     NotifySend,
 }
@@ -1125,9 +1126,56 @@ fn overlay_text(title: &str, body: &str) -> String {
     }
 }
 
+fn overlay_script_path() -> Option<PathBuf> {
+    let current_dir_candidate = env::current_dir().ok()?.join("overlay.py");
+    if current_dir_candidate.is_file() && command_exists("python3") {
+        return Some(current_dir_candidate);
+    }
+
+    let current_exe = env::current_exe().ok()?;
+    for ancestor in current_exe.ancestors() {
+        let candidate = ancestor.join("overlay.py");
+        if candidate.is_file() && command_exists("python3") {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn fallback_overlay_backend() -> Option<OverlayBackend> {
+    if command_exists("zenity") {
+        Some(OverlayBackend::Zenity)
+    } else if command_exists("notify-send") {
+        Some(OverlayBackend::NotifySend)
+    } else {
+        None
+    }
+}
+
+fn spawn_bubble(
+    script: &Path,
+    mode: &str,
+    title: &str,
+    body: &str,
+    timeout_secs: u64,
+) -> Result<Child> {
+    Command::new("python3")
+        .arg(script)
+        .arg(mode)
+        .arg(title)
+        .arg(body)
+        .arg(timeout_secs.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn voice overlay")
+}
+
 impl Overlay {
     fn new() -> Self {
-        let backend = if command_exists("zenity") {
+        let backend = if let Some(script) = overlay_script_path() {
+            Some(OverlayBackend::Bubble(script))
+        } else if command_exists("zenity") {
             Some(OverlayBackend::Zenity)
         } else if command_exists("notify-send") {
             Some(OverlayBackend::NotifySend)
@@ -1162,7 +1210,16 @@ impl Overlay {
 
     fn show_state(&mut self, title: &str, body: &str, restore_focus: Option<&str>) {
         self.close_active();
-        match self.backend {
+        match self.backend.as_ref() {
+            Some(OverlayBackend::Bubble(script)) => {
+                match spawn_bubble(script, "state", title, body, 0) {
+                    Ok(child) => {
+                        self.active_child = Some(child);
+                        self.refocus(restore_focus);
+                    }
+                    Err(_) => self.backend = fallback_overlay_backend(),
+                }
+            }
             Some(OverlayBackend::Zenity) => {
                 match Command::new("zenity")
                     .args([
@@ -1176,6 +1233,7 @@ impl Overlay {
                         "--width",
                         "320",
                     ])
+                    .env("GSK_RENDERER", "cairo")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -1216,7 +1274,16 @@ impl Overlay {
         restore_focus: Option<&str>,
     ) {
         self.close_active();
-        match self.backend {
+        match self.backend.as_ref() {
+            Some(OverlayBackend::Bubble(script)) => {
+                match spawn_bubble(script, "notice", title, body, timeout_secs) {
+                    Ok(child) => {
+                        self.active_child = Some(child);
+                        self.refocus(restore_focus);
+                    }
+                    Err(_) => self.backend = fallback_overlay_backend(),
+                }
+            }
             Some(OverlayBackend::Zenity) => {
                 let text = overlay_text(title, body);
                 let script = r#"sleep "$VOICE_DICTATION_TIMEOUT"; printf '100\n' | zenity --progress --no-cancel --auto-close --percentage=0 --title="Voice Dictation" --text="$VOICE_DICTATION_TEXT" --width=340"#;
@@ -1224,6 +1291,7 @@ impl Overlay {
                     .args(["-lc", script])
                     .env("VOICE_DICTATION_TIMEOUT", timeout_secs.to_string())
                     .env("VOICE_DICTATION_TEXT", text)
+                    .env("GSK_RENDERER", "cairo")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()

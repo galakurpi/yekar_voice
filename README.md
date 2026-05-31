@@ -3,7 +3,7 @@
 Rust background dictation tool for Pop!_OS / GNOME / X11.
 
 Current runtime:
-- Hold `Ctrl+Alt+Q` to record
+- Hold `Alt+Space` to record
 - Shows a tiny floating status bubble while listening and finalizing
 - Release to stream/finalize OpenAI STT by default
 - Uses OpenAI realtime transcription with `gpt-realtime-whisper` by default
