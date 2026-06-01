@@ -2478,6 +2478,7 @@ fn is_terminal_app(app_name: &str) -> bool {
         "alacritty",
         "konsole",
         "terminator",
+        "lmux",
         "tilix",
         "xterm",
         "tmux",
@@ -2934,10 +2935,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_detection_includes_lmux_wm_class() {
+        assert!(is_terminal_app(
+            r#"WM_CLASS(STRING) = "lmux", "lmux" TERMINAL - Workspace 8853"#
+        ));
+    }
+
+    #[test]
     fn terminator_uses_terminal_paste_keybinding() {
         let config = PasteConfig::default();
         assert_eq!(
             paste_keybinding(r#"WM_CLASS(STRING) = "terminator", "Terminator""#, &config),
+            "ctrl+shift+v"
+        );
+    }
+
+    #[test]
+    fn lmux_uses_terminal_paste_keybinding() {
+        let config = PasteConfig::default();
+        assert_eq!(
+            paste_keybinding(r#"WM_CLASS(STRING) = "lmux", "lmux""#, &config),
             "ctrl+shift+v"
         );
     }
