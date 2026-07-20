@@ -6,6 +6,8 @@ use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::{ops::softmax, VarBuilder};
 use candle_transformers::models::whisper::{self as m, audio, Config as WhisperConfig};
 use clap::{Parser, Subcommand};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{BufferSize, SampleRate, StreamConfig};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -18,9 +20,10 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 use tungstenite::client::IntoClientRequest;
@@ -737,61 +740,104 @@ fn percentile_metric(conn: &Connection, column: &str, q: f64) -> Result<Option<f
 
 struct Recorder {
     config: AudioConfig,
-    child: Option<Child>,
-    reader: Option<JoinHandle<Result<Vec<u8>>>>,
+    stream: Option<cpal::Stream>,
+    sample_buf: Arc<Mutex<Vec<f32>>>,
     chunk_rx: Option<Receiver<Vec<u8>>>,
+    actual_sample_rate: u32,
 }
 
 impl Recorder {
     fn new(config: AudioConfig) -> Self {
+        let rate = config.target_sample_rate_hz;
         Self {
             config,
-            child: None,
-            reader: None,
+            stream: None,
+            sample_buf: Arc::new(Mutex::new(Vec::new())),
             chunk_rx: None,
+            actual_sample_rate: rate,
         }
     }
 
     fn start_recording(&mut self, stream_chunks: bool) -> Result<()> {
-        if self.child.is_some() {
+        if self.stream.is_some() {
             return Ok(());
         }
-        let source = if self.config.device.trim().is_empty() {
-            "default".to_string()
+
+        let host = cpal::default_host();
+        let device = if self.config.device.trim().is_empty() {
+            host.default_input_device()
+                .context("no default audio input device")?
         } else {
-            self.config.device.clone()
+            host.input_devices()
+                .context("failed to enumerate audio devices")?
+                .find(|d| d.name().map(|n| n == self.config.device).unwrap_or(false))
+                .with_context(|| format!("audio device '{}' not found", self.config.device))?
         };
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-f",
-                "pulse",
-                "-i",
-                &source,
-                "-ac",
-                &self.config.channels.to_string(),
-                "-ar",
-                &self.config.target_sample_rate_hz.to_string(),
-                "-f",
-                "f32le",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start ffmpeg recorder")?;
-        let stdout = child.stdout.take().context("missing ffmpeg stdout")?;
-        let (chunk_tx, chunk_rx) = if stream_chunks {
-            let (tx, rx) = mpsc::channel();
-            (Some(tx), Some(rx))
+
+        let target_rate = self.config.target_sample_rate_hz;
+
+        // Check whether the device supports the requested sample rate; fall back
+        // to the device default and resample in stop_recording() if not.
+        let rate_supported = device
+            .supported_input_configs()
+            .map(|iter| {
+                iter.any(|r| {
+                    r.min_sample_rate().0 <= target_rate && r.max_sample_rate().0 >= target_rate
+                })
+            })
+            .unwrap_or(false);
+
+        let (actual_rate, num_channels) = if rate_supported {
+            (target_rate, self.config.channels)
         } else {
-            (None, None)
+            let default_cfg = device
+                .default_input_config()
+                .context("failed to get default input config")?;
+            (default_cfg.sample_rate().0, default_cfg.channels())
         };
-        self.reader = Some(spawn_reader(stdout, chunk_tx));
-        self.chunk_rx = chunk_rx;
-        self.child = Some(child);
+        self.actual_sample_rate = actual_rate;
+
+        let stream_cfg = StreamConfig {
+            channels: num_channels,
+            sample_rate: SampleRate(actual_rate),
+            buffer_size: BufferSize::Default,
+        };
+
+        let (chunk_tx, chunk_rx_opt): (Option<Sender<Vec<u8>>>, Option<Receiver<Vec<u8>>>) =
+            if stream_chunks {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+        self.chunk_rx = chunk_rx_opt;
+
+        let buf = Arc::clone(&self.sample_buf);
+        let ch = num_channels as usize;
+
+        let stream = device.build_input_stream(
+            &stream_cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Mix down to mono if needed
+                let mono: Vec<f32> = if ch == 1 {
+                    data.to_vec()
+                } else {
+                    data.chunks(ch)
+                        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+                        .collect()
+                };
+                buf.lock().unwrap().extend_from_slice(&mono);
+                if let Some(tx) = &chunk_tx {
+                    let bytes: Vec<u8> = mono.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let _ = tx.send(bytes);
+                }
+            },
+            |err| eprintln!("cpal stream error: {err}"),
+            None,
+        )?;
+
+        stream.play().context("failed to start audio stream")?;
+        self.stream = Some(stream);
         Ok(())
     }
 
@@ -801,60 +847,23 @@ impl Recorder {
 
     fn stop_recording(&mut self) -> Result<Vec<f32>> {
         thread::sleep(Duration::from_millis(self.config.tail_ms));
-        self.stop_process()?;
-        let bytes = self.take_bytes()?;
-        Ok(bytes_to_samples(&bytes))
+        // Dropping the stream stops callbacks immediately
+        drop(self.stream.take());
+        let samples: Vec<f32> = self.sample_buf.lock().unwrap().drain(..).collect();
+        let target = self.config.target_sample_rate_hz;
+        if self.actual_sample_rate != target && !samples.is_empty() {
+            Ok(resample_linear_mono(&samples, self.actual_sample_rate, target))
+        } else {
+            Ok(samples)
+        }
     }
 
     fn cancel_recording(&mut self) -> Result<()> {
-        self.stop_process()?;
-        let _ = self.take_bytes()?;
-        Ok(())
-    }
-
-    fn stop_process(&mut self) -> Result<()> {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.child = None;
+        drop(self.stream.take());
+        self.sample_buf.lock().unwrap().clear();
         self.chunk_rx = None;
         Ok(())
     }
-
-    fn take_bytes(&mut self) -> Result<Vec<u8>> {
-        if let Some(reader) = self.reader.take() {
-            reader
-                .join()
-                .map_err(|_| anyhow!("recorder reader thread panicked"))?
-        } else {
-            Ok(Vec::new())
-        }
-    }
-}
-
-fn spawn_reader(
-    mut stdout: ChildStdout,
-    chunk_tx: Option<Sender<Vec<u8>>>,
-) -> JoinHandle<Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let chunk = &buf[..count];
-                    bytes.extend_from_slice(chunk);
-                    if let Some(tx) = &chunk_tx {
-                        let _ = tx.send(chunk.to_vec());
-                    }
-                }
-                Err(err) => return Err(anyhow!("recorder read: {err}")),
-            }
-        }
-        Ok(bytes)
-    })
 }
 
 fn bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
@@ -1107,17 +1116,22 @@ fn apply_replacements(text: &str, profile: &DeveloperProfile) -> String {
     out
 }
 
+// ── Overlay: Linux (GTK bubble / zenity / notify-send) ───────────────────────
+
+#[cfg(target_os = "linux")]
 enum OverlayBackend {
     Bubble(PathBuf),
     Zenity,
     NotifySend,
 }
 
+#[cfg(target_os = "linux")]
 struct Overlay {
     backend: Option<OverlayBackend>,
     active_child: Option<Child>,
 }
 
+#[cfg(target_os = "linux")]
 fn overlay_text(title: &str, body: &str) -> String {
     if body.trim().is_empty() {
         title.to_string()
@@ -1126,6 +1140,7 @@ fn overlay_text(title: &str, body: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn overlay_script_path() -> Option<PathBuf> {
     let current_dir_candidate = env::current_dir().ok()?.join("overlay.py");
     if current_dir_candidate.is_file() && command_exists("python3") {
@@ -1142,6 +1157,7 @@ fn overlay_script_path() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn fallback_overlay_backend() -> Option<OverlayBackend> {
     if command_exists("zenity") {
         Some(OverlayBackend::Zenity)
@@ -1152,6 +1168,7 @@ fn fallback_overlay_backend() -> Option<OverlayBackend> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_bubble(
     script: &Path,
     mode: &str,
@@ -1171,6 +1188,7 @@ fn spawn_bubble(
         .context("failed to spawn voice overlay")
 }
 
+#[cfg(target_os = "linux")]
 impl Overlay {
     fn new() -> Self {
         let backend = if let Some(script) = overlay_script_path() {
@@ -1322,6 +1340,27 @@ impl Overlay {
             }
             None => {}
         }
+    }
+}
+
+// ── Overlay: macOS / Windows (no-op; terminal output is the feedback) ─────────
+
+#[cfg(not(target_os = "linux"))]
+struct Overlay;
+
+#[cfg(not(target_os = "linux"))]
+impl Overlay {
+    fn new() -> Self {
+        Self
+    }
+    fn show_state(&mut self, _title: &str, _body: &str, _restore_focus: Option<&str>) {}
+    fn show_notice(
+        &mut self,
+        _title: &str,
+        _body: &str,
+        _timeout_secs: u64,
+        _restore_focus: Option<&str>,
+    ) {
     }
 }
 
@@ -2421,19 +2460,25 @@ fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+// ── Active window detection ──────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
 fn active_window_id() -> Option<String> {
     command_output(&["xdotool", "getwindowfocus"]).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn active_window_name() -> Option<String> {
     command_output(&["xdotool", "getwindowfocus", "getwindowname"]).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn active_window_class() -> Option<String> {
     let window_id = active_window_id()?;
     command_output(&["xprop", "-id", &window_id, "WM_CLASS"]).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn active_app() -> String {
     let class = active_window_class();
     let title = active_window_name();
@@ -2447,21 +2492,84 @@ fn active_app() -> String {
     }
 }
 
-fn write_clipboard(text: &str) -> Result<()> {
-    let mut child = Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(anyhow!("xclip failed"));
-    }
-    Ok(())
+// On macOS, active_window_id() returns the frontmost application name.
+// focus_window() passes it back to `osascript … to activate`.
+#[cfg(target_os = "macos")]
+fn active_window_id() -> Option<String> {
+    command_output(&[
+        "osascript",
+        "-e",
+        "tell application \"System Events\" to get name of first process whose frontmost is true",
+    ])
+    .ok()
 }
 
+#[cfg(target_os = "macos")]
+fn active_window_name() -> Option<String> {
+    active_window_id()
+}
+
+#[cfg(target_os = "macos")]
+fn active_window_class() -> Option<String> {
+    active_window_id()
+}
+
+#[cfg(target_os = "macos")]
+fn active_app() -> String {
+    active_window_id().unwrap_or_else(|| "unknown".to_string())
+}
+
+// On Windows, active_window_id() returns the HWND as a decimal string.
+#[cfg(target_os = "windows")]
+fn active_window_id() -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == 0 {
+        None
+    } else {
+        Some((hwnd as usize).to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn active_window_name() -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if len <= 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn active_window_class() -> Option<String> {
+    active_window_name()
+}
+
+#[cfg(target_os = "windows")]
+fn active_app() -> String {
+    active_window_name().unwrap_or_else(|| "unknown".to_string())
+}
+
+// ── Clipboard ────────────────────────────────────────────────────────────────
+
+fn write_clipboard(text: &str) -> Result<()> {
+    arboard::Clipboard::new()
+        .context("failed to open system clipboard")?
+        .set_text(text)
+        .context("failed to write to clipboard")
+}
+
+// ── Window focus ─────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
 fn focus_window(window_id: Option<&str>) -> Result<()> {
     let Some(window_id) = window_id else {
         return Ok(());
@@ -2469,10 +2577,42 @@ fn focus_window(window_id: Option<&str>) -> Result<()> {
     run_command(&["xdotool", "windowactivate", "--sync", window_id])
 }
 
+#[cfg(target_os = "macos")]
+fn focus_window(window_id: Option<&str>) -> Result<()> {
+    let Some(app) = window_id else {
+        return Ok(());
+    };
+    let script = format!("tell application \"{}\" to activate", app);
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn focus_window(window_id: Option<&str>) -> Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    let Some(id_str) = window_id else {
+        return Ok(());
+    };
+    let hwnd = id_str.parse::<usize>().unwrap_or(0);
+    if hwnd != 0 {
+        unsafe {
+            SetForegroundWindow(hwnd as _);
+        }
+    }
+    Ok(())
+}
+
+// ── Terminal detection & paste ───────────────────────────────────────────────
+
 fn is_terminal_app(app_name: &str) -> bool {
     let app = app_name.to_ascii_lowercase();
     [
         "terminal",
+        "iterm",
         "wezterm",
         "kitty",
         "alacritty",
@@ -2515,9 +2655,48 @@ fn paste_text(
     thread::sleep(Duration::from_millis(50));
     focus_window(target_window)?;
     thread::sleep(Duration::from_millis(50));
-    let keybinding = paste_keybinding(app_name, config);
-    println!("Paste keybinding: {keybinding} app={app_name}");
-    run_command(&["xdotool", "key", "--clearmodifiers", keybinding])?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let keybinding = paste_keybinding(app_name, config);
+        println!("Paste keybinding: {keybinding} app={app_name}");
+        run_command(&["xdotool", "key", "--clearmodifiers", keybinding])?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+        println!("Paste (enigo) app={app_name}");
+        let mut enigo =
+            Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init: {e}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            // Command+V on macOS (all apps including terminals)
+            enigo
+                .key(Key::Meta, Direction::Press)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+            enigo
+                .key(Key::Unicode('v'), Direction::Click)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+            enigo
+                .key(Key::Meta, Direction::Release)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Ctrl+V on Windows
+            enigo
+                .key(Key::Control, Direction::Press)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+            enigo
+                .key(Key::Unicode('v'), Direction::Click)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+            enigo
+                .key(Key::Control, Direction::Release)
+                .map_err(|e| anyhow!("enigo: {e}"))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -2966,11 +3145,7 @@ mod tests {
 }
 
 fn command_exists(command: &str) -> bool {
-    Command::new("sh")
-        .args(["-lc", &format!("command -v {command} >/dev/null 2>&1")])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    which::which(command).is_ok()
 }
 
 fn run_doctor(config: &Config, config_path: &Path, metrics_path: &Path) -> Result<()> {
@@ -3006,18 +3181,51 @@ fn run_doctor(config: &Config, config_path: &Path, metrics_path: &Path) -> Resul
             println!("Local fallback model alias: {}", config.asr.local_model);
         }
     }
-    println!("ffmpeg: {}", command_exists("ffmpeg"));
-    println!("xclip: {}", command_exists("xclip"));
-    println!("xdotool: {}", command_exists("xdotool"));
-    println!("notify-send: {}", command_exists("notify-send"));
-    println!("pactl: {}", command_exists("pactl"));
-    println!("Audio sources:");
-    match Command::new("pactl")
-        .args(["list", "short", "sources"])
-        .output()
+    println!("Audio input devices (cpal):");
+    match cpal::default_host().input_devices() {
+        Ok(devices) => {
+            let mut found = false;
+            for d in devices {
+                println!("  {}", d.name().unwrap_or_else(|_| "<unnamed>".to_string()));
+                found = true;
+            }
+            if !found {
+                println!("  (none found)");
+            }
+        }
+        Err(e) => println!("  error enumerating devices: {e}"),
+    }
+    #[cfg(target_os = "linux")]
     {
-        Ok(out) if out.status.success() => print!("{}", String::from_utf8_lossy(&out.stdout)),
-        _ => println!("  pactl unavailable"),
+        println!("xdotool: {}", command_exists("xdotool"));
+        println!("xprop: {}", command_exists("xprop"));
+        println!("notify-send: {}", command_exists("notify-send"));
+        println!("zenity: {}", command_exists("zenity"));
+        println!("python3 (overlay): {}", command_exists("python3"));
+        println!("pactl: {}", command_exists("pactl"));
+        if command_exists("pactl") {
+            println!("PulseAudio/PipeWire sources (pactl):");
+            match Command::new("pactl").args(["list", "short", "sources"]).output() {
+                Ok(out) if out.status.success() => {
+                    print!("{}", String::from_utf8_lossy(&out.stdout));
+                }
+                _ => println!("  pactl unavailable"),
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        println!("osascript: {}", command_exists("osascript"));
+        // Verify Accessibility permission needed by enigo for paste simulation.
+        let ax_ok = Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to get name of first process whose frontmost is true",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        println!("Accessibility API (osascript): {ax_ok}");
     }
     Ok(())
 }

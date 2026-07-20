@@ -5,13 +5,16 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+arboard = "3"
 base64 = "0.22"
 byteorder = "1.5"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 clap = { version = "4.5", features = ["derive"] }
+cpal = "0.15"
 dirs = "5.0"
+enigo = "0.2"
 global-hotkey = "0.7"
 hf-hub = "0.5"
 hound = "3.5"
@@ -22,6 +25,10 @@ serde_json = "1.0"
 tokenizers = "0.22"
 toml = "0.8"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+which = "6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 [profile.release]
 codegen-units = 1
